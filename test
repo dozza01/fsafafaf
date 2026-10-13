@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         TransDesk 
+// @name         TransDesk 1
 // @description  1
 
 // @namespace    TransDesk
@@ -15,9 +15,10 @@
 // @connect      openrouter.ai
 // @connect      integrate.api.nvidia.com
 // @connect      www2.deepl.com
+// @connect      www.deepl.com
 // @match        *://*/*
 // @run-at       document-start
-// @version      2026.2.01
+// @version      2026.2.02
 // @icon         https://raw.githubusercontent.com/PoopSoftWare/dhub/refs/heads/main/trasdesk.png
 // @tag          translation
 // @tag          text selection
@@ -225,98 +226,221 @@ limitations under the License.
             ontimeout: function () { callback({ ok: false, error: 'Таймаут ответа от NVIDIA API' }); }
         });
     }
-    // ===== DeepL — прямой вызов JSON-RPC API (как в официальном расширении) =====
+    // ===== DeepL — No-Key JSON-RPC (внутренний web/extension endpoint) =====
+    // Важно: это НЕ официальный API с ключом. DeepL периодически меняет
+    // внутренний endpoint/формат, поэтому здесь есть основной запрос
+    // LMT_handle_texts и fallback на LMT_handle_jobs.
     function getDeepLTimestamp(i_count) {
-    const ts = Date.now();
-    if (i_count === 0) return ts;
-    i_count++;
-    return ts - (ts % i_count) + i_count;
+        const ts = Date.now();
+        if (i_count === 0) return ts;
+        i_count++;
+        return ts - (ts % i_count) + i_count;
     }
+
+    function getDeepLLang(targetLang) {
+        const langMap = {
+            'en': 'EN-US', 'en-US': 'EN-US', 'en-GB': 'EN-GB',
+            'ru': 'RU', 'de': 'DE', 'fr': 'FR', 'es': 'ES',
+            'it': 'IT', 'pt': 'PT-BR', 'pt-BR': 'PT-BR', 'pt-PT': 'PT-PT',
+            'nl': 'NL', 'pl': 'PL', 'ja': 'JA', 'zh-CN': 'ZH-HANS',
+            'zh-TW': 'ZH-HANT', 'zh': 'ZH', 'ko': 'KO', 'ar': 'AR',
+            'tr': 'TR', 'uk': 'UK', 'cs': 'CS', 'da': 'DA', 'fi': 'FI',
+            'el': 'EL', 'hu': 'HU', 'id': 'ID', 'no': 'NB', 'nb': 'NB',
+            'ro': 'RO', 'sv': 'SV', 'bg': 'BG', 'hr': 'HR', 'sk': 'SK',
+            'sl': 'SL', 'et': 'ET', 'lt': 'LT', 'lv': 'LV'
+        };
+        return langMap[targetLang] || String(targetLang || 'EN').toUpperCase();
+    }
+
+    function parseDeepLResponse(response, callback) {
+        const status = Number(response.status || 0);
+        const raw = String(response.responseText || '').trim();
+
+        // HTML (например Cloudflare/403) — это именно та причина,
+        // по которой раньше появлялся Unexpected token '<'.
+        if (!raw || raw[0] === '<') {
+            if (status === 429) {
+                callback({ ok: false, retryable: true, error: 'DeepL: слишком много запросов (429).' });
+            } else if (status === 403) {
+                callback({ ok: false, retryable: true, error: 'DeepL: сервер отклонил No-Key запрос (403).' });
+            } else {
+                callback({ ok: false, retryable: true, error: 'DeepL вернул HTML вместо JSON (HTTP ' + status + ').' });
+            }
+            return;
+        }
+
+        let data;
+        try {
+            data = JSON.parse(raw);
+        } catch (e) {
+            callback({ ok: false, retryable: true, error: 'DeepL вернул некорректный JSON (HTTP ' + status + ').' });
+            return;
+        }
+
+        // Вариант LMT_handle_texts.
+        const textResult = data && data.result && data.result.texts && data.result.texts[0];
+        if (textResult && typeof textResult.text === 'string') {
+            callback({
+                ok: true,
+                text: textResult.text,
+                detected: (data.result.lang && (data.result.lang.detected || data.result.lang)) || null
+            });
+            return;
+        }
+
+        // Вариант LMT_handle_jobs.
+        const translation = data && data.result && data.result.translations && data.result.translations[0];
+        if (translation && Array.isArray(translation.beams) && translation.beams[0]) {
+            callback({
+                ok: true,
+                text: translation.beams[0].postprocessed_sentence || translation.beams[0].text || '',
+                detected: data.result.lang || null
+            });
+            return;
+        }
+
+        if (data && data.error) {
+            const msg = data.error.message || data.error.code || 'неизвестная ошибка';
+            callback({
+                ok: false,
+                retryable: status === 429 || /too many|quota|rate/i.test(msg),
+                error: 'DeepL: ' + msg
+            });
+            return;
+        }
+
+        callback({ ok: false, retryable: true, error: 'DeepL вернул неизвестный формат ответа (HTTP ' + status + ').' });
+    }
+
     function translateWithDeepL(text, targetLang, callback) {
-    const url = 'https://www2.deepl.com/jsonrpc';
-    const id = Math.floor(Math.random() * 9000000) + 1000000;
-    const langMap = {
-    'en': 'EN-US', 'ru': 'RU', 'de': 'DE', 'fr': 'FR', 'es': 'ES',
-    'it': 'IT', 'pt': 'PT-BR', 'pt-BR': 'PT-BR', 'nl': 'NL', 'pl': 'PL',
-    'ja': 'JA', 'zh-CN': 'ZH', 'zh-TW': 'ZH', 'zh': 'ZH', 'ko': 'KO',
-    'ar': 'AR', 'tr': 'TR', 'uk': 'UK', 'cs': 'CS', 'da': 'DA',
-    'fi': 'FI', 'el': 'EL', 'hu': 'HU', 'id': 'ID', 'no': 'NB',
-    'nb': 'NB', 'ro': 'RO', 'sv': 'SV', 'bg': 'BG', 'hr': 'HR',
-    'sk': 'SK', 'sl': 'SL', 'et': 'ET', 'lt': 'LT', 'lv': 'LV'
-    };
-    const dlTarget = langMap[targetLang] || targetLang.toUpperCase();
-    const i_count = (text.match(/i/g) || []).length;
-    const timestamp = getDeepLTimestamp(i_count);
-    const payload = {
-    jsonrpc: "2.0",
-    method: "LMT_handle_jobs",
-    params: {
-    jobs: [{
-    kind: "default",
-    raw_en_sentence: text,
-    raw_en_context_before: [],
-    raw_en_context_after: [],
-    preferred_num_beams: 4
-    }],
-    lang: {
-    target_lang: dlTarget,
-    source_lang_computed: "auto"
-    },
-    priority: 1,
-    commonJobParams: {
-    browserVisible: true,
-    browserType: "Chrome",
-    version: "20240917"
-    },
-    timestamp: timestamp
-    },
-    id: id
-    };
-    let jsonStr = JSON.stringify(payload);
-    if (id % 3 === 0) {
-    jsonStr = jsonStr.replace(/","/g, '", "').replace(/":"/g, '": "').replace(/":/g, '": ');
-    } else {
-    jsonStr = jsonStr.replace(/","/g, '", "').replace(/":"/g, '": "');
-    }
-    GM_xmlhttpRequest({
-    method: 'POST',
-    url: url,
-    timeout: 15000,
-    headers: {
-    'Content-Type': 'application/json; charset=UTF-8',
-    'Accept': '*/*',
-    'X-App-Name': 'chrome-extension',
-    'Origin': 'https://www.deepl.com',
-    'Referer': 'https://www.deepl.com/'
-    },
-    data: jsonStr,
-    onload: function (response) {
-    try {
-    const data = JSON.parse(response.responseText);
-    if (data.result && data.result.translations && data.result.translations[0]) {
-    const beams = data.result.translations[0].beams;
-    if (beams && beams.length > 0) {
-    callback(beams[0].postprocessed_sentence, data.result.lang || null);
-    } else {
-    callback('Ошибка: DeepL вернул пустой результат', null);
-    }
-    } else if (data.error) {
-    const msg = data.error.message || 'неизвестная ошибка';
-    if (response.status === 429 || msg.indexOf('quota') !== -1) {
-    callback('DeepL: превышен лимит запросов. Подождите минуту.', null);
-    } else {
-    callback('Ошибка DeepL: ' + msg, null);
-    }
-    } else {
-    callback('Ошибка: неверный формат ответа DeepL', null);
-    }
-    } catch (e) {
-    callback('Ошибка разбора ответа DeepL: ' + e.message, null);
-    }
-    },
-    onerror: function () { callback('Ошибка соединения с DeepL', null); },
-    ontimeout: function () { callback('Таймаут при обращении к DeepL', null); }
-    });
+        const cleanText = String(text == null ? '' : text).trim();
+        if (!cleanText) {
+            callback('', null);
+            return;
+        }
+
+        const dlTarget = getDeepLLang(targetLang);
+        const i_count = (cleanText.match(/i/g) || []).length;
+        const timestamp = getDeepLTimestamp(i_count);
+        const id = Math.floor(Math.random() * 900000000) + 100000000;
+
+        // Современный формат, используемый веб/extension-клиентами DeepL.
+        const primaryUrl = 'https://www2.deepl.com/jsonrpc?client=chrome-extension,1.28.0&method=LMT_handle_texts';
+        const primaryPayload = {
+            jsonrpc: '2.0',
+            method: 'LMT_handle_texts',
+            id: id,
+            params: {
+                texts: [{ text: cleanText, requestAlternatives: 0 }],
+                splitting: 'newlines',
+                lang: {
+                    source_lang_user_selected: 'auto',
+                    target_lang: dlTarget
+                },
+                timestamp: timestamp,
+                commonJobParams: {
+                    wasSpoken: false,
+                    transcribe_as: ''
+                }
+            }
+        };
+
+        // Старый формат оставляем как fallback — DeepL меняет внутренний API.
+        const fallbackPayload = {
+            jsonrpc: '2.0',
+            method: 'LMT_handle_jobs',
+            id: id + 1,
+            params: {
+                jobs: [{
+                    kind: 'default',
+                    raw_en_sentence: cleanText,
+                    raw_en_context_before: [],
+                    raw_en_context_after: [],
+                    preferred_num_beams: 4
+                }],
+                lang: {
+                    source_lang_user_selected: 'auto',
+                    source_lang_computed: 'auto',
+                    target_lang: dlTarget
+                },
+                priority: 1,
+                commonJobParams: {},
+                timestamp: timestamp
+            }
+        };
+
+        function request(url, payload, isFallback) {
+            let body = JSON.stringify(payload);
+
+            // Некоторые версии внутреннего клиента DeepL ожидают именно такой
+            // пробел вокруг method. Это не меняет JSON-смысл, но совпадает с
+            // форматом, который использовали их web/extension клиенты.
+            const requestId = Number(payload.id) || 0;
+            const methodSpacing = ((requestId + 5) % 29 === 0 || (requestId + 3) % 13 === 0)
+                ? '"method" : "'
+                : '"method": "';
+            body = body.replace('"method":"', methodSpacing);
+
+            GM_xmlhttpRequest({
+                method: 'POST',
+                url: url,
+                timeout: 20000,
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': '*/*',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Origin': 'https://www.deepl.com',
+                    'Referer': 'https://www.deepl.com/translator',
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                data: body,
+                onload: function (response) {
+                    parseDeepLResponse(response, function (result) {
+                        if (result.ok) {
+                            callback(result.text, result.detected);
+                            return;
+                        }
+
+                        // Если основной endpoint вернул HTML/403/429/неподдерживаемый
+                        // формат, пробуем старый LMT_handle_jobs один раз.
+                        if (!isFallback && result.retryable) {
+                            request(
+                                'https://www2.deepl.com/jsonrpc?client=chrome-extension,1.28.0&method=LMT_handle_jobs',
+                                fallbackPayload,
+                                true
+                            );
+                            return;
+                        }
+
+                        callback(result.error, null);
+                    });
+                },
+                onerror: function () {
+                    if (!isFallback) {
+                        request(
+                            'https://www2.deepl.com/jsonrpc?client=chrome-extension,1.28.0&method=LMT_handle_jobs',
+                            fallbackPayload,
+                            true
+                        );
+                    } else {
+                        callback('Ошибка соединения с DeepL', null);
+                    }
+                },
+                ontimeout: function () {
+                    if (!isFallback) {
+                        request(
+                            'https://www2.deepl.com/jsonrpc?client=chrome-extension,1.28.0&method=LMT_handle_jobs',
+                            fallbackPayload,
+                            true
+                        );
+                    } else {
+                        callback('Таймаут при обращении к DeepL', null);
+                    }
+                }
+            });
+        }
+
+        request(primaryUrl, primaryPayload, false);
     }
 
     let utstLogoPreloadImage = null;
